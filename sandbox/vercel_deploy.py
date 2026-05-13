@@ -1,9 +1,13 @@
 """Deploy a local Next.js workspace to Vercel using the Vercel REST API.
 
-The hosted MCP endpoint (``https://mcp.vercel.com``) uses Streamable HTTP + session
-negotiation and is oriented toward approved MCP clients — not raw JSON-RPC POSTs to
-``/sse``. For a headless sandbox agent, **``POST https://api.vercel.com/v13/deployments``**
-with the same ``VERCEL_TOKEN`` is the supported programmatic path.
+Uses ``Authorization: Bearer`` with (in order of preference when the caller omits a token):
+
+- **``VERCEL_TOKEN``** — Personal Access Token from https://vercel.com/account/tokens
+  (required for most ``POST /v13/deployments`` usage; OAuth user tokens often get HTTP 403).
+- **Per-user OAuth** — ``.agent_vercel_user_token.json`` in the workspace (``complete_vercel_oauth``).
+
+``POST https://api.vercel.com/v13/deployments`` — same token family as dashboard tokens;
+OAuth access tokens are documented at https://vercel.com/docs/sign-in-with-vercel/tokens
 """
 
 from __future__ import annotations
@@ -20,6 +24,8 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+
+from sandbox.vercel_oauth import resolve_vercel_access_token
 
 logger = logging.getLogger(__name__)
 
@@ -121,11 +127,17 @@ async def deploy_to_vercel(
         else:
             logger.info("%s", msg)
 
-    token = (vercel_token or "").strip() or (os.getenv("VERCEL_TOKEN") or "").strip()
+    token = (vercel_token or "").strip()
+    if not token:
+        token = (os.getenv("VERCEL_TOKEN") or "").strip()
+    if not token:
+        token = resolve_vercel_access_token(workspace_root) or ""
     if not token:
         raise RuntimeError(
-            "VERCEL_TOKEN is not set (and vercel_token was empty). "
-            "Create a token at https://vercel.com/account/tokens"
+            "No Vercel credentials. Either:\n"
+            "• **Per-user:** run **begin_vercel_oauth** (loopback callback auto-completes when `VERCEL_OAUTH_REDIRECT_URI` is `http://127.0.0.1:…`); otherwise paste the callback URL into **complete_vercel_oauth**;\n"
+            "• **Operator:** set **VERCEL_TOKEN** on the agent host (PAT from "
+            "https://vercel.com/account/tokens )."
         )
 
     name = project_name.strip().lower()
@@ -159,9 +171,18 @@ async def deploy_to_vercel(
             json=payload,
         )
         if create.status_code >= 400:
+            body = (create.text or "")[:2000]
+            hint = ""
+            if create.status_code == 403:
+                hint = (
+                    "\n\n**Likely cause:** Sign-in-with-Vercel OAuth access tokens (`vca_…`) "
+                    "often **cannot** create deployments via `POST /v13/deployments` (Vercel returns 403). "
+                    "**Fix:** create a Personal Access Token at https://vercel.com/account/tokens "
+                    "and set **`VERCEL_TOKEN`** in `.env` on the agent host, then restart. "
+                    "When `VERCEL_TOKEN` is set, deploy uses the PAT instead of workspace OAuth."
+                )
             raise RuntimeError(
-                f"Vercel create deployment failed: HTTP {create.status_code} "
-                f"{(create.text or '')[:2000]}"
+                f"Vercel create deployment failed: HTTP {create.status_code} {body}{hint}"
             )
         try:
             dep = create.json()

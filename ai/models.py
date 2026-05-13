@@ -16,6 +16,7 @@ class UserContext:
     workspace_dir: str
     skip_preview: bool
     preview_public_base_url: str
+    billing_user_key: str
 
 
 class SandboxResponse(BaseModel):

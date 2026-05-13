@@ -35,6 +35,8 @@ out/
 .agent_build_attempts
 .agent_github_device.json
 .agent_github_user_token
+.agent_vercel_oauth.json
+.agent_vercel_user_token.json
 """
 
 
