@@ -1,22 +1,28 @@
 """
 Chat protocol for nextjs-sandbox-agent.
 
-Flow: ACK inbound → extract text → run AI pipeline → stream updates → send final reply.
+Flow: ACK inbound → extract text → (usage / payment gate) → run AI pipeline → stream updates → send final reply.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 
 from uagents import Context, Protocol
 from uagents_core.contrib.protocols.chat import (
     ChatAcknowledgement,
     ChatMessage,
     EndSessionContent,
+    MetadataContent,
     StartSessionContent,
     TextContent,
     chat_protocol_spec,
 )
+from uagents_core.contrib.protocols.payment import Funds, RequestPayment
+
+from protocols.payment_proto import payment_recipient_address
+from sandbox import usage_limits
 
 logger = logging.getLogger("chat_proto")
 
@@ -41,6 +47,45 @@ def _extract_text(msg: ChatMessage) -> str:
         if isinstance(item, TextContent) and item.text:
             parts.append(item.text)
     return "\n".join(parts).strip()
+
+
+def _billing_user_key(sender: str, msg: ChatMessage) -> str:
+    """Prefer ``email`` / ``user_email`` from ``MetadataContent``; else uAgent ``sender`` address."""
+    for item in msg.content or []:
+        if isinstance(item, MetadataContent):
+            md = item.metadata or {}
+            for k in ("email", "user_email", "mail"):
+                v = (md.get(k) or "").strip().lower()
+                if v and "@" in v:
+                    return v
+    return (sender or "").strip()
+
+
+async def _maybe_send_payment_request(ctx: Context, sender: str, billing_key: str) -> None:
+    """Send Agent Payment Protocol ``RequestPayment`` (buyer role = this agent)."""
+    recipient = payment_recipient_address(ctx)
+    if not recipient:
+        logger.warning("PAYMENT_RECIPIENT_ADDRESS unset and agent address unavailable; skip RequestPayment")
+        return
+    try:
+        amount = (os.getenv("PAYMENT_PRICE_AMOUNT") or "9.99").strip()
+        currency = (os.getenv("PAYMENT_CURRENCY") or "USD").strip()
+        method = (os.getenv("PAYMENT_METHOD") or "stripe").strip()
+        deadline = int(os.getenv("PAYMENT_DEADLINE_SECONDS") or "86400")
+        req = RequestPayment(
+            accepted_funds=[Funds(amount=amount, currency=currency, payment_method=method)],
+            recipient=recipient,
+            deadline_seconds=max(60, deadline),
+            reference=billing_key[:2000],
+            description="Next.js sandbox agent — continued website generations after free tier",
+            metadata={
+                "product": "nextjs-sandbox-agent",
+                "free_tier_sites": str(usage_limits.get_free_site_quota()),
+            },
+        )
+        await ctx.send(sender, req)
+    except Exception as exc:
+        logger.warning("Failed to send RequestPayment to %s: %s", sender, exc)
 
 
 async def _ack(ctx: Context, sender: str, msg: ChatMessage) -> None:
@@ -80,12 +125,25 @@ async def handle_message(ctx: Context, sender: str, msg: ChatMessage) -> None:
     if not combined_prompt:
         return
 
+    billing_key = _billing_user_key(sender, msg)
+
     logger.info(
         "Processing: session=%s sender=%s text=%s%s",
         session_id, sender,
         combined_prompt[:120],
         "..." if len(combined_prompt) > 120 else "",
     )
+
+    if not usage_limits.can_start_new_site(billing_key) and not usage_limits.has_payment_entitlement(
+        billing_key
+    ):
+        await _maybe_send_payment_request(ctx, sender, billing_key)
+        await _reply(
+            ctx,
+            sender,
+            usage_limits.payment_block_message(billing_key),
+        )
+        return
 
     try:
         from ai import ask
@@ -96,6 +154,7 @@ async def handle_message(ctx: Context, sender: str, msg: ChatMessage) -> None:
             session_id=session_id,
             question=combined_prompt,
             logger=logger,
+            billing_user_key=billing_key,
         ):
             chunk_type = chunk.get("type")
 

@@ -5,6 +5,7 @@ __pycache__/
 # Secrets and local env — never commit (keep .env.example tracked)
 .env*
 !.env.example
+.agent_usage.json
 *.log
 .DS_Store
 dist/

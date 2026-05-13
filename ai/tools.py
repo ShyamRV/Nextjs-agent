@@ -19,11 +19,12 @@ from ai.models import (
     set_approval_state,
 )
 from ai.session_workspace import session_workspace_enabled
-from sandbox import preview_registry
+from sandbox import preview_registry, usage_limits
 from sandbox.github_device import (
     complete_device_authorization,
     request_device_authorization,
 )
+from sandbox import vercel_oauth
 from sandbox.github_publish import publish_workspace_to_github as github_publish_sync
 from sandbox.vercel_deploy import deploy_to_vercel
 from sandbox.e2b_preview import deploy_nextjs_preview_to_e2b
@@ -46,6 +47,8 @@ _WAIT_INSTALL_SEC = float(os.getenv("NPM_WAIT_FOR_INSTALL_SEC", "600"))
 _npm_locks: dict[str, asyncio.Lock] = {}
 # Serialize GitHub device flow (concurrent chat messages must not corrupt device state)
 _github_device_locks: dict[str, asyncio.Lock] = {}
+# Serialize Vercel OAuth PKCE pending state
+_vercel_oauth_locks: dict[str, asyncio.Lock] = {}
 
 
 def _npm_lock(workspace_key: str) -> asyncio.Lock:
@@ -58,6 +61,12 @@ def _github_device_lock(workspace_key: str) -> asyncio.Lock:
     if workspace_key not in _github_device_locks:
         _github_device_locks[workspace_key] = asyncio.Lock()
     return _github_device_locks[workspace_key]
+
+
+def _vercel_oauth_lock(workspace_key: str) -> asyncio.Lock:
+    if workspace_key not in _vercel_oauth_locks:
+        _vercel_oauth_locks[workspace_key] = asyncio.Lock()
+    return _vercel_oauth_locks[workspace_key]
 
 
 def _root(runtime: ToolRuntime[UserContext, dict[str, Any]]) -> Path:
@@ -326,6 +335,12 @@ async def start_dev_preview(
         return "Preview disabled (SKIP_PREVIEW_DEV=true)."
 
     root = _root(runtime)
+    if not usage_limits.can_start_new_site(ctx.billing_user_key):
+        return (
+            "Free preview quota for your account is exhausted, or payment is required before "
+            "starting another preview. Send a chat message to receive a payment request, or ask the operator."
+        )
+
     use_dev = os.getenv("PREVIEW_USE_NEXT_DEV", "").lower() in {"1", "true", "yes", "on"}
 
     if not use_dev and not (root / ".next").is_dir():
@@ -364,6 +379,7 @@ async def start_dev_preview(
         preview_registry.mark_deferred_workspace_delete(str(root))
         asyncio.create_task(_cleanup())
         write("E2B preview ready.")
+        usage_limits.record_successful_site_generation(ctx.billing_user_key)
         return "\n".join([
             url,
             "",
@@ -404,6 +420,7 @@ async def start_dev_preview(
     preview_registry.mark_deferred_workspace_delete(str(root))
     asyncio.create_task(_cleanup())
     write("Preview URL ready.")
+    usage_limits.record_successful_site_generation(ctx.billing_user_key)
     return "\n".join([
         url,
         "",
@@ -461,6 +478,82 @@ async def complete_github_device_login(
 
 
 @tool
+async def begin_vercel_oauth(
+    runtime: ToolRuntime[UserContext, dict[str, Any]],
+) -> str:
+    """Link the user's Vercel account (Sign in with Vercel, OAuth 2.0 + PKCE).
+
+    Requires ``VERCEL_OAUTH_CLIENT_ID`` and ``VERCEL_OAUTH_REDIRECT_URI`` on the agent.
+
+    **Seamless (default):** If ``VERCEL_OAUTH_REDIRECT_URI`` is ``http://127.0.0.1:PORT/...``
+    or ``http://localhost:PORT/...``, this tool prints the authorize link, listens on that
+    port, and completes the flow when the user approves — **no pasting the callback URL**.
+
+    **Manual:** HTTPS / remote callbacks, or ``VERCEL_OAUTH_AUTO_CALLBACK=false``: user pastes
+    the callback URL into **complete_vercel_oauth**.
+
+    See: https://vercel.com/docs/sign-in-with-vercel/authorization-server-api
+    """
+    write = runtime.stream_writer
+    root = _root(runtime)
+    lock = _vercel_oauth_lock(str(root))
+    write("Starting Vercel sign-in…")
+    async with lock:
+        try:
+            authorize_url, redirect_uri, local_bind = await asyncio.to_thread(
+                vercel_oauth.prepare_vercel_oauth, root
+            )
+        except Exception as e:
+            return f"begin_vercel_oauth failed: {e}"
+        write(
+            "**Open this link in your browser** (log into the Vercel account that should own deploys):\n"
+            f"{authorize_url}"
+        )
+        if vercel_oauth.will_auto_capture_redirect(redirect_uri):
+            write("Waiting for Vercel to redirect back to this machine (no URL paste needed)…")
+        try:
+            msg = await asyncio.to_thread(
+                vercel_oauth.wait_vercel_oauth_local,
+                root,
+                authorize_url,
+                redirect_uri,
+                local_bind,
+            )
+        except Exception as e:
+            return f"begin_vercel_oauth failed: {e}"
+    write("Vercel sign-in step finished.")
+    return msg
+
+
+@tool
+async def complete_vercel_oauth(
+    authorization_response_url: str,
+    runtime: ToolRuntime[UserContext, dict[str, Any]],
+) -> str:
+    """Exchange the OAuth callback for Vercel tokens; save them in this workspace.
+
+    Args:
+        authorization_response_url: The **full URL** from the browser after redirect
+            (must include ``code`` and ``state`` query parameters).
+    """
+    write = runtime.stream_writer
+    root = _root(runtime)
+    lock = _vercel_oauth_lock(str(root))
+    write("Completing Vercel OAuth...")
+    async with lock:
+        try:
+            msg = await asyncio.to_thread(
+                vercel_oauth.complete_vercel_oauth,
+                root,
+                authorization_response_url,
+            )
+        except Exception as e:
+            return f"complete_vercel_oauth failed: {e}"
+    write("Vercel account linked for this workspace.")
+    return msg
+
+
+@tool
 async def publish_workspace_to_github(
     repo_name: str,
     description: str,
@@ -486,6 +579,12 @@ async def publish_workspace_to_github(
     """
     write = runtime.stream_writer
     root = _root(runtime)
+    ctx = runtime.context
+    if not usage_limits.can_start_new_site(ctx.billing_user_key):
+        return (
+            "Publishing is blocked: free preview quota is exhausted or payment is required. "
+            "Send a chat message on this agent to open the payment flow."
+        )
     org = organization.strip() or None
     write("Publishing workspace to GitHub...")
     try:
@@ -536,6 +635,11 @@ async def deploy_to_github_and_vercel(
     write = runtime.stream_writer
     root = _root(runtime)
     ctx = runtime.context
+    if not usage_limits.can_start_new_site(ctx.billing_user_key):
+        return (
+            "Deploy is blocked: free preview quota is exhausted or payment is required. "
+            "Send a chat message on this agent to open the payment flow."
+        )
     org = organization.strip() or None
 
     st0 = get_approval_state(ctx.user_id, ctx.session_id)
@@ -566,7 +670,9 @@ async def deploy_to_github_and_vercel(
 
     write("GitHub publish finished.")
 
-    vercel_tok = (os.getenv("VERCEL_TOKEN") or "").strip()
+    # PAT first: Sign-in-with-Vercel OAuth tokens (`vca_…`) often return 403 on
+    # POST /v13/deployments; personal access tokens work for REST deploys.
+    vercel_tok = (os.getenv("VERCEL_TOKEN") or "").strip() or vercel_oauth.resolve_vercel_access_token(root) or ""
     if not vercel_tok:
         st_done = get_approval_state(ctx.user_id, ctx.session_id)
         set_approval_state(
@@ -581,9 +687,10 @@ async def deploy_to_github_and_vercel(
             ),
         )
         return (
-            "OK: GitHub publish succeeded; Vercel skipped (VERCEL_TOKEN not set).\n"
+            "OK: GitHub publish succeeded; Vercel skipped (no credentials).\n"
             f"GitHub URL: {github_url}\n"
-            "Set VERCEL_TOKEN to enable Vercel deployment (REST API)."
+            "Link Vercel: run **begin_vercel_oauth** (opens browser; loopback callback is automatic when configured), "
+            "or set **VERCEL_TOKEN** (PAT) on the server for deploys without OAuth."
         )
 
     write("Deploying to Vercel (REST API)...")
@@ -679,6 +786,8 @@ tools = [
     start_dev_preview,
     begin_github_device_login,
     complete_github_device_login,
+    begin_vercel_oauth,
+    complete_vercel_oauth,
     publish_workspace_to_github,
     deploy_to_github_and_vercel,
     signal_preview_approval,

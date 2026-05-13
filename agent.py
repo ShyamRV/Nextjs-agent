@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
+import socket
 from pathlib import Path
 
 import dotenv
@@ -19,6 +19,7 @@ if _state_dir:
     os.chdir(_state_dir)
 
 from protocols.chat_proto import nextjs_sandbox_chat_proto
+from protocols.payment_proto import payment_merchant_proto
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("agent")
@@ -40,6 +41,13 @@ def _load_seed() -> str:
     if seed:
         return seed
     raise RuntimeError("AGENT_SEED is not set.")
+
+
+def _tcp_port_in_use(port: int, host: str = "127.0.0.1") -> bool:
+    """True if something is already accepting TCP connections on ``host:port``."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.5)
+        return s.connect_ex((host, port)) == 0
 
 
 AGENT_NAME = os.getenv("AGENT_NAME", "nextjs_sandbox_agent")
@@ -75,6 +83,18 @@ async def startup(ctx: Context) -> None:
 
 
 agent.include(nextjs_sandbox_chat_proto, publish_manifest=True)
+agent.include(payment_merchant_proto, publish_manifest=True)
 
 if __name__ == "__main__":
+    if _tcp_port_in_use(AGENT_PORT):
+        raise RuntimeError(
+            f"Port {AGENT_PORT} is already in use (WinError 10048 / EADDRINUSE). "
+            "Another `python agent.py` or app is bound to it.\n\n"
+            "Fix:\n"
+            "• Stop the other agent: close its terminal or press Ctrl+C there.\n"
+            f"• Or find the process: PowerShell `Get-NetTCPConnection -LocalPort {AGENT_PORT}` "
+            "then `Stop-Process -Id <OwningProcess> -Force`.\n"
+            f"• Or use a free port: set AGENT_PORT=8030 in .env (update Agentverse / "
+            "inspector URL to match)."
+        )
     agent.run()

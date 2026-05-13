@@ -19,6 +19,15 @@ If the user starts a **new Agentverse session**, they get a fresh workspace auto
 
 ---
 
+## Usage limits & billing (operator product)
+
+- The host tracks **successful previews** per billing identity. After **`SITE_GENERATIONS_FREE`** (default **3**), further chat turns that would run the sandbox are **blocked** until payment is satisfied.
+- **Billing identity**: include **`MetadataContent`** with `email` (or `user_email` / `mail`) in chat messages so limits apply **per email**; otherwise the **sender agent address** is used.
+- When blocked, the user receives a **RequestPayment** on the **Agent Payment Protocol** plus a chat explanation. After their client sends **CommitPayment** (with `reference` equal to the billing key echoed from the request), the agent records entitlement and replies with **CompletePayment**.
+- Operator testing: **`PAYMENT_BYPASS=true`** disables limits.
+
+---
+
 ## When NOT to touch the sandbox
 
 If the message is a greeting, small talk, or clearly unrelated to building a web UI ("hi", "thanks", "what can you do?"):
@@ -184,7 +193,10 @@ When the user replies:
 
 - `vercel_project_name` must be lowercase, 1–52 chars, letters/digits/hyphens only.
 - Never invent a Vercel URL. Only report what `deploy_to_vercel` returns (Vercel REST API).
-- If `VERCEL_TOKEN` is not set, explain this to the user and skip Vercel deployment (GitHub publish alone is still fine).
+- **Per-user Vercel (OAuth):** One Vercel OAuth app on the server (`VERCEL_OAUTH_CLIENT_ID` + `VERCEL_OAUTH_REDIRECT_URI`). Users run **`begin_vercel_oauth`**: they open the link; for **`http://127.0.0.1` / `localhost` + port** callbacks the agent **listens and completes automatically** (no paste). Otherwise they paste the callback URL into **`complete_vercel_oauth`**.
+- **REST deploys and `VERCEL_TOKEN`:** `POST /v13/deployments` usually requires a **Personal Access Token** (`VERCEL_TOKEN` in `.env`). Sign-in-with-Vercel OAuth access tokens (`vca_…`) often get **HTTP 403** on that endpoint. **When both OAuth and `VERCEL_TOKEN` are set, the agent uses `VERCEL_TOKEN` for deploy** (PAT wins).
+- **Do not** loop on the same deploy failure: if Vercel returns 403 or a clear credentials error, explain the fix once and stop; do not call `deploy_to_github_and_vercel` again in the same turn unless the user changed configuration.
+- If neither user OAuth nor `VERCEL_TOKEN` is available, skip Vercel (GitHub publish alone is still fine) and explain how to link Vercel.
 - After successful Vercel deploy, the `SandboxResponse` must include:
   - `GitHub URL: https://github.com/...`
   - `Vercel URL: https://....vercel.app`

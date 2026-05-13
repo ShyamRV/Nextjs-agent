@@ -17,6 +17,7 @@ from langchain.agents import create_agent
 from langchain.agents.structured_output import ToolStrategy
 from langchain_openai import ChatOpenAI
 from langchain_core.runnables import RunnableConfig
+from langgraph.errors import GraphRecursionError
 
 from ai.llm_config import resolve_llm_settings, session_headers
 from ai.models import SandboxResponse, UserContext
@@ -123,20 +124,23 @@ class AI:
         session_id: str,
         question: str,
         logger: logging.Logger,
+        billing_user_key: str | None = None,
     ) -> AsyncGenerator[dict[str, str | None], None]:
         root = await get_or_create_workspace(user_id, session_id)
         skip_preview = os.getenv("SKIP_PREVIEW_DEV", "").lower() in {"1", "true", "yes", "on"}
         preview_base = (os.getenv("PREVIEW_PUBLIC_BASE_URL") or "").strip()
         thread_id = f"njss:{user_id}:{session_id}"
+        bill = (billing_user_key or user_id or "").strip() or user_id
 
         try:
             if not self._checkpointer:
                 raise ValueError("Agent not initialized — call setup_agent() first")
 
             agent = self._build_graph(session_id)
+            rec_lim = int(os.getenv("AGENT_RECURSION_LIMIT", "80"))
             config: RunnableConfig = {
                 "configurable": {"thread_id": thread_id},
-                "recursion_limit": 50,
+                "recursion_limit": max(25, min(rec_lim, 200)),
             }
 
             final_state: dict[str, Any] | None = None
@@ -149,6 +153,7 @@ class AI:
                     workspace_dir=str(root),
                     skip_preview=skip_preview,
                     preview_public_base_url=preview_base,
+                    billing_user_key=bill,
                 ),
                 stream_mode=["custom", "values"],
             ):
@@ -161,6 +166,23 @@ class AI:
             logger.info("[ai] final response type=%s", out.get("type"))
             yield out
 
+        except GraphRecursionError:
+            logger.warning(
+                "Graph recursion limit reached (thread_id=%s) — often repeated failing tool calls",
+                thread_id,
+            )
+            yield {
+                "type": "error",
+                "text": (
+                    "The assistant stopped: it hit the maximum number of steps, usually because a "
+                    "tool (often Vercel deploy) kept failing and the model retried in a loop. "
+                    "Check the **terminal logs** for the first real error.\n\n"
+                    "If you see **Vercel HTTP 403** on `POST …/deployments`: set **`VERCEL_TOKEN`** "
+                    "to a Personal Access Token from https://vercel.com/account/tokens in `.env`, "
+                    "restart the agent, and try again. (OAuth-only `vca_` tokens often cannot use "
+                    "that REST deploy endpoint.)"
+                ),
+            }
         except Exception:
             logger.exception("Error processing Next.js sandbox request")
             yield {"type": "error", "text": "Something went wrong. Please try again."}
@@ -189,7 +211,8 @@ def ask(
     session_id: str,
     question: str,
     logger: logging.Logger,
+    billing_user_key: str | None = None,
 ) -> AsyncGenerator[dict[str, str | None], None]:
     if _ai is None:
         raise RuntimeError("AI not initialized. Call setup_ai_instance() first.")
-    return _ai.ask(user_id, session_id, question, logger)
+    return _ai.ask(user_id, session_id, question, logger, billing_user_key=billing_user_key)
