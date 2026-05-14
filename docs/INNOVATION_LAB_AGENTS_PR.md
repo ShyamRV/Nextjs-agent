@@ -17,6 +17,35 @@ A full agent tree under **`agents/nextjs-sandbox-agent/`** was built against a c
 
 Repo-wide **`.cursor/`** rules (payment lifecycle, DB-first chat, PR checks, etc.) already live at the monorepo root; you do **not** duplicate them inside the agent folder unless the team asks for agent-specific rules.
 
+## Prepared clone (this machine)
+
+If you used the same workspace layout as during setup, a shallow clone of **`staging`** with the agent commit already applied may exist at:
+
+`nextjs-sandbox-agent-clean/innovation-lab-agents-temp`
+
+Latest commit on that clone: **`9d8b318`** (`feat(agents): add nextjs-sandbox-agent for staging PR`).
+
+To publish that work to **your** `innovation-lab-agents` fork:
+
+```bash
+cd innovation-lab-agents-temp
+git remote rename origin upstream
+git remote add origin https://github.com/<your-org>/innovation-lab-agents.git
+git push -u origin staging:feature/add-nextjs-sandbox-agent
+```
+
+Then open the PR on GitHub (**base: `staging`**). Adjust branch names if your fork already uses `staging`.
+
+### Alternative: apply the patch in your fork
+
+In your fork (on `staging` after `git pull upstream staging`):
+
+```bash
+git am docs/patches/0001-feat-agents-add-nextjs-sandbox-agent-for-staging-PR.patch
+```
+
+Use the patch file from the **`ShyamRV/Nextjs-agent`** branch **`docs/innovation-lab-pr`** (or copy it from this repo under `docs/patches/`).
+
 ## How to land the PR
 
 1. **Fork** [fetchai/innovation-lab-agents](https://github.com/fetchai/innovation-lab-agents) (if you have not already).
